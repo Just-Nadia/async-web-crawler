@@ -14,7 +14,7 @@ from .errors import RobotsBlockedError
 
 class RobotsParser:
     """Парсер robots.txt с кэшированием."""
-    
+
     def __init__(
         self,
         user_agent: str = "*",
@@ -22,7 +22,7 @@ class RobotsParser:
         timeout: float = 10.0,
     ):
         """Инициализация.
-        
+
         Args:
             user_agent: User-Agent для проверки правил
             cache_ttl: Время жизни кэша в секундах
@@ -31,14 +31,16 @@ class RobotsParser:
         self.user_agent = user_agent
         self.cache_ttl = cache_ttl
         self.timeout = timeout
-        
+
         # Кэш: domain -> (RobotFileParser, timestamp)
         self._cache: Dict[str, tuple] = {}
+        # Кэш crawl-delay: domain -> Optional[float]
+        self._crawl_delay_cache: Dict[str, Optional[float]] = {}
         self._locks: Dict[str, asyncio.Lock] = {}
         self._session: Optional[aiohttp.ClientSession] = None
-        
+
         self.logger = get_logger(__name__)
-    
+
     async def _get_session(self) -> aiohttp.ClientSession:
         """Получить или создать сессию."""
         if self._session is None or self._session.closed:
@@ -48,13 +50,13 @@ class RobotsParser:
                 headers={"User-Agent": self.user_agent},
             )
         return self._session
-    
+
     async def close(self) -> None:
         """Закрыть сессию."""
         if self._session and not self._session.closed:
             await self._session.close()
             self._session = None
-    
+
     def _get_domain(self, url: str) -> str:
         """Извлечь домен из URL."""
         try:
@@ -62,61 +64,61 @@ class RobotsParser:
             return f"{parsed.scheme}://{parsed.netloc}"
         except Exception:
             return ""
-    
+
     def _get_robots_url(self, url: str) -> str:
         """Получить URL robots.txt для сайта."""
         domain = self._get_domain(url)
         return urljoin(domain, "/robots.txt") if domain else ""
-    
+
     def _is_cache_valid(self, domain: str) -> bool:
         """Проверить, актуален ли кэш для домена."""
         if domain not in self._cache:
             return False
-        
+
         _, timestamp = self._cache[domain]
         return (time.monotonic() - timestamp) < self.cache_ttl
-    
+
     async def fetch_robots(self, base_url: str) -> Optional[RobotFileParser]:
         """Загрузить и распарсить robots.txt для сайта.
-        
+
         Args:
             base_url: URL сайта
-            
+
         Returns:
             RobotFileParser или None, если robots.txt недоступен
         """
         domain = self._get_domain(base_url)
         if not domain:
             return None
-        
+
         # Проверяем кэш
         if self._is_cache_valid(domain):
             parser, _ = self._cache[domain]
             return parser
-        
+
         # Блокировка на домен, чтобы не грузить robots.txt параллельно
         if domain not in self._locks:
             self._locks[domain] = asyncio.Lock()
-        
+
         async with self._locks[domain]:
             # Повторная проверка после получения блокировки
             if self._is_cache_valid(domain):
                 parser, _ = self._cache[domain]
                 return parser
-            
+
             parser = await self._download_robots(base_url)
             self._cache[domain] = (parser, time.monotonic())
             return parser
-    
+
     async def _download_robots(self, base_url: str) -> Optional[RobotFileParser]:
         """Скачать и распарсить robots.txt."""
         robots_url = self._get_robots_url(base_url)
         if not robots_url:
             return None
-        
+
         parser = RobotFileParser()
         parser.set_url(robots_url)
-        
+
         try:
             session = await self._get_session()
             async with session.get(robots_url) as response:
@@ -125,13 +127,13 @@ class RobotsParser:
                     parser.parse(content.splitlines())
                     self.logger.debug(f"robots.txt загружен: {robots_url}")
                     return parser
-                
+
                 elif response.status == 404:
                     # robots.txt отсутствует — всё разрешено
                     self.logger.debug(f"robots.txt не найден: {robots_url}")
                     parser.parse([])  # Пустые правила = всё разрешено
                     return parser
-                
+
                 else:
                     self.logger.warning(
                         f"robots.txt вернул {response.status}: {robots_url}"
@@ -139,84 +141,97 @@ class RobotsParser:
                     # При ошибке — разрешаем всё, но логируем
                     parser.parse([])
                     return parser
-        
+
         except asyncio.TimeoutError:
             self.logger.warning(f"Таймаут загрузки robots.txt: {robots_url}")
             parser.parse([])
             return parser
-        
+
         except aiohttp.ClientError as e:
             self.logger.warning(f"Ошибка загрузки robots.txt: {e}")
             parser.parse([])
             return parser
-        
+
         except Exception as e:
             self.logger.error(f"Неожиданная ошибка robots.txt: {e}")
             return None
-    
+
     async def can_fetch(self, url: str, user_agent: Optional[str] = None) -> bool:
         """Проверить, разрешён ли URL для данного User-Agent.
-        
+
         Args:
             url: Проверяемый URL
             user_agent: User-Agent (по умолчанию self.user_agent)
-            
+
         Returns:
             bool: True если URL разрешён
         """
         ua = user_agent or self.user_agent
-        
+
         parser = await self.fetch_robots(url)
         if parser is None:
             # Не смогли получить robots — разрешаем
             return True
-        
+
         try:
             return parser.can_fetch(ua, url)
         except Exception as e:
             self.logger.warning(f"Ошибка проверки can_fetch: {e}")
             return True
-    
+
     async def get_crawl_delay(self, url: str, user_agent: Optional[str] = None) -> Optional[float]:
-        """Получить Crawl-delay из robots.txt.
-        
+        """Получить Crawl-delay из robots.txt (с кэшированием).
+
         Args:
             url: URL сайта
             user_agent: User-Agent
-            
+
         Returns:
             Optional[float]: Задержка в секундах или None
         """
         ua = user_agent or self.user_agent
-        
+        domain = self._get_domain(url)
+        if not domain:
+            return None
+
+        # Кэш по домену — robots.txt один на сайт
+        if domain in self._crawl_delay_cache:
+            return self._crawl_delay_cache[domain]
+
         parser = await self.fetch_robots(url)
         if parser is None:
+            self._crawl_delay_cache[domain] = None
             return None
-        
+
         try:
             delay = parser.crawl_delay(ua)
-            return float(delay) if delay is not None else None
+            value = float(delay) if delay is not None else None
         except Exception:
-            return None
-    
+            value = None
+
+        self._crawl_delay_cache[domain] = value
+        return value
+
     async def check_url(self, url: str) -> None:
         """Проверить URL и бросить исключение, если запрещён.
-        
+
         Raises:
             RobotsBlockedError: Если URL запрещён
         """
         if not await self.can_fetch(url):
             raise RobotsBlockedError(f"URL запрещён robots.txt", url)
-    
+
     def get_stats(self) -> dict:
         """Получить статистику."""
         return {
             "user_agent": self.user_agent,
             "cached_domains": len(self._cache),
+            "cached_crawl_delays": len(self._crawl_delay_cache),
             "cache_ttl": self.cache_ttl,
         }
-    
+
     def clear_cache(self) -> None:
-        """Очистить кэш robots.txt."""
+        """Очистить кэш robots.txt (включая кэш Crawl-delay)."""
         self._cache.clear()
         self._locks.clear()
+        self._crawl_delay_cache.clear()

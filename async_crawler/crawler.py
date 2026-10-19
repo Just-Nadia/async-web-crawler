@@ -29,7 +29,7 @@ from .retry import RetryStrategy, CircuitBreaker
 
 class AsyncCrawler:
     """Асинхронный веб-краулер."""
-    
+
     def __init__(
         self,
         max_concurrent: int = 10,
@@ -42,7 +42,7 @@ class AsyncCrawler:
         storage: Optional[Any] = None,
     ):
         """Инициализация краулера.
-        
+
         Args:
             max_concurrent: Максимум одновременных запросов
             max_depth: Максимальная глубина обхода
@@ -62,13 +62,13 @@ class AsyncCrawler:
             respect_robots=respect_robots,
             user_agent=user_agent,
         )
-        
+
         self.logger = get_logger(__name__)
         self.storage = storage
-        
+
         # Сессия создаётся лениво
         self._session: Optional[aiohttp.ClientSession] = None
-        
+
         # Компоненты
         self.queue = CrawlerQueue()
         self.semaphores = SemaphoreManager(
@@ -86,7 +86,7 @@ class AsyncCrawler:
             user_agent=self.config.robots_user_agent,
             cache_ttl=self.config.robots_cache_ttl,
         ) if self.config.respect_robots else None
-        
+
         self.retry = RetryStrategy.from_config(self.config.retry)
         self.circuit_breaker = (
             CircuitBreaker(
@@ -97,21 +97,21 @@ class AsyncCrawler:
             )
             if self.config.circuit_breaker.enabled else None
         )
-        
+
         self.parser = HTMLParser(
             extract_links=self.config.extract_links,
             extract_text=self.config.extract_text,
             extract_metadata=self.config.extract_metadata,
         ) if self.config.parse_html else None
-        
+
         # Результаты
         self.results: Dict[str, PageData] = {}
         self.error_results: Dict[str, Dict[str, str]] = {}
-        
+
         # Скомпилированные фильтры URL
         self._exclude_re = [re.compile(p) for p in self.config.exclude_patterns]
         self._include_re = [re.compile(p) for p in self.config.include_patterns]
-        
+
         # Статистика
         self._started_at: Optional[float] = None
         self._stats = {
@@ -122,11 +122,11 @@ class AsyncCrawler:
             "blocked_by_robots": 0,
             "blocked_by_circuit": 0,
         }
-        
+
         # Счётчики, читаемые advanced_crawler.py
         self.retries = 0
         self.blocked_by_robots = 0
-    
+
     async def _get_session(self) -> aiohttp.ClientSession:
         """Получить или создать HTTP-сессию."""
         if self._session is None or self._session.closed:
@@ -147,79 +147,99 @@ class AsyncCrawler:
                 headers={"User-Agent": self.config.user_agent},
             )
         return self._session
-    
+
     async def close(self) -> None:
         """Закрыть все ресурсы."""
         if self._session and not self._session.closed:
             await self._session.close()
             self._session = None
-        
+
         if self.robots:
             await self.robots.close()
-        
+
         if self.storage and hasattr(self.storage, 'close'):
             try:
                 await self.storage.close()
             except Exception as e:
                 self.logger.warning(f"Ошибка закрытия storage: {e}")
-        
+
         self.logger.info("Краулер закрыт")
-    
+
     # ---------- Базовые методы загрузки ----------
-    
-    async def fetch_url(self, url: str) -> str:
-        """Загрузить одну страницу.
-        
-        Args:
-            url: URL страницы
-            
-        Returns:
-            str: HTML-контент
-            
-        Raises:
-            CrawlerError: При ошибке загрузки
+
+    async def _fetch_url_raw(self, url: str) -> str:
+        """Загрузить страницу без ограничения конкурентности (внутренний метод).
+
+        Не берёт семафоры — вызывающий сам решает, как ограничивать конкурентность.
+        Используется в fetch_url()/fetch_urls() через обёртки и в основном
+        pipeline (_process_one), который уже держит семафоры.
         """
         session = await self._get_session()
-        
+
         try:
             async with session.get(url, allow_redirects=True) as response:
                 if response.status >= 400:
                     raise classify_http_error(response.status, url)
-                
+
                 content_type = response.headers.get("Content-Type", "")
                 if "text/html" not in content_type and "application/xhtml" not in content_type:
                     raise PermanentError(
                         f"Неподдерживаемый Content-Type: {content_type}",
                         url,
                     )
-                
+
                 html = await response.text(errors="ignore")
                 return html
-        
+
         except aiohttp.ClientResponseError as e:
             raise classify_http_error(e.status, url)
-        
+
         except asyncio.TimeoutError:
             raise TransientError("Таймаут запроса", url)
-        
+
         except aiohttp.ClientConnectorError as e:
             raise NetworkError(f"Ошибка соединения: {e}", url)
-        
+
         except aiohttp.ClientError as e:
             raise NetworkError(f"Сетевая ошибка: {e}", url)
-        
+
         except CrawlerError:
             raise
-        
+
         except Exception as e:
             raise CrawlerError(f"Неизвестная ошибка: {e}", url)
-    
+
+    async def fetch_url(self, url: str) -> str:
+        """Загрузить одну страницу с учётом max_concurrent и per-domain лимита.
+
+        Использует те же семафоры, что и основной pipeline, поэтому
+        fetch_url()/fetch_urls() не обходят ограничение конкурентности.
+
+        Args:
+            url: URL страницы
+
+        Returns:
+            str: HTML-контент
+
+        Raises:
+            CrawlerError: При ошибке загрузки
+        """
+        domain_sem = await self.semaphores.acquire(url)
+        try:
+            return await self._fetch_url_raw(url)
+        finally:
+            await self.semaphores.release(url, domain_sem)
+
     async def fetch_urls(self, urls: List[str]) -> Dict[str, str]:
-        """Параллельно загрузить список URL.
-        
+        """Параллельно загрузить список URL с ограничением конкурентности.
+
+        Конкурентность ограничивается SemaphoreManager (max_concurrent + per-domain),
+        поэтому создавать задачу на каждый URL безопасно: реально в полёте
+        будет не больше разрешённого числа запросов.
+
         Args:
             urls: Список URL
-            
+
         Returns:
             Dict[str, str]: url -> html (только успешные)
         """
@@ -230,51 +250,56 @@ class AsyncCrawler:
             except Exception as e:
                 self.logger.warning(f"Ошибка загрузки {url}: {e}")
                 return url, None
-        
+
         tasks = [safe_fetch(url) for url in urls]
         results = await asyncio.gather(*tasks, return_exceptions=False)
-        
+
         return {url: html for url, html in results if html is not None}
-    
-    async def fetch_and_parse(self, url: str) -> Optional[PageData]:
+
+    async def fetch_and_parse(self, url: str, use_semaphore: bool = True) -> Optional[PageData]:
         """Загрузить и распарсить страницу.
-        
+
         Args:
             url: URL страницы
-            
+            use_semaphore: Брать ли семафоры. Передайте False, если вызывающий
+                уже взял их (например, _process_one).
+
         Returns:
             PageData или None при ошибке
         """
         try:
             fetch_start = time.monotonic()
-            html = await self.fetch_url(url)
+            if use_semaphore:
+                html = await self.fetch_url(url)
+            else:
+                html = await self._fetch_url_raw(url)
             fetch_time = time.monotonic() - fetch_start
-            
+
             if self.parser is None:
                 # Без парсинга — только HTML
                 return PageData(url=url, html=html, fetch_time=fetch_time, status_code=200)
-            
+
             parse_start = time.monotonic()
             page = await self.parser.parse_html(html, url)
             page.parse_time = time.monotonic() - parse_start
             page.fetch_time = fetch_time
             page.status_code = 200
-            
+
             return page
-        
+
         except Exception:
             raise
-    
+
     # ---------- Обработка одного URL с полным pipeline ----------
-    
+
     async def _process_one(self, url: str, depth: int) -> Optional[PageData]:
         """Обработать один URL со всеми проверками и повторами."""
         # Проверка circuit breaker
         if self.circuit_breaker and not self.circuit_breaker.is_available(url):
             self._stats["blocked_by_circuit"] += 1
             raise CircuitBreakerOpenError(f"Домен временно недоступен", url)
-        
-        # Проверка robots.txt
+
+        # Проверка robots.txt + Crawl-delay
         if self.robots:
             try:
                 allowed = await self.robots.can_fetch(url)
@@ -283,50 +308,58 @@ class AsyncCrawler:
                     self.blocked_by_robots += 1
                     self.logger.info(f"robots.txt запрещает: {url}")
                     raise RobotsBlockedError(f"URL запрещён robots.txt", url)
+
+                # Уважаем Crawl-delay из robots.txt.
+                # set_domain_interval идемпотентен: только увеличивает интервал,
+                # поэтому повторные вызовы на тот же домен безопасны.
+                crawl_delay = await self.robots.get_crawl_delay(url)
+                if crawl_delay:
+                    self.rate_limiter.set_domain_interval(url, crawl_delay)
             except RobotsBlockedError:
                 raise
             except Exception as e:
                 self.logger.warning(f"Ошибка проверки robots: {e}")
-        
-        # Rate limiting
+
+        # Rate limiting (учитывает Crawl-delay через RateLimiter)
         await self.rate_limiter.acquire(url)
-        
+
         # Семафоры: глобальный + по домену
         domain_sem = await self.semaphores.acquire(url)
-        
+
         async def do_fetch():
-            return await self.fetch_and_parse(url)
-        
+            # Семафоры уже взяты снаружи — не берём их повторно.
+            return await self.fetch_and_parse(url, use_semaphore=False)
+
         try:
             page = await self.retry.execute_with_retry(do_fetch)
-            
+
             if self.circuit_breaker:
                 self.circuit_breaker.record_success(url)
-            
+
             self._stats["pages_fetched"] += 1
             if self.parser:
                 self._stats["pages_parsed"] += 1
-            
+
             self.retries = self.retry.get_stats()["retries"]
-            
+
             return page
-        
+
         except Exception as e:
             if self.circuit_breaker:
                 self.circuit_breaker.record_failure(url)
-            
+
             self._stats["errors"] += 1
             self.error_results[url] = {
                 "error": str(e),
                 "error_type": type(e).__name__,
             }
             raise
-        
+
         finally:
             await self.semaphores.release(url, domain_sem)
-    
+
     # ---------- Основной цикл краулинга ----------
-    
+
     async def crawl(
         self,
         start_urls: List[str],
@@ -336,14 +369,14 @@ class AsyncCrawler:
         show_progress: bool = False,
     ) -> Dict[str, PageData]:
         """Запустить краулинг.
-        
+
         Args:
             start_urls: Стартовые URL
             max_pages: Максимум страниц (перекрывает конфиг)
             max_depth: Максимальная глубина (перекрывает конфиг)
             same_domain_only: Только тот же домен
             show_progress: Показывать прогресс
-            
+
         Returns:
             Dict[str, PageData]: url -> PageData
         """
@@ -353,49 +386,64 @@ class AsyncCrawler:
             same_domain_only if same_domain_only is not None
             else self.config.same_domain_only
         )
-        
+
         self._started_at = time.monotonic()
         self.results = {}
         self.error_results = {}
-        
+
         # Домены стартовых URL (для фильтра same_domain_only)
         start_domains: Set[str] = set()
         for url in start_urls:
             start_domains.add(urlparse(url).netloc)
-        
+
         # Добавляем стартовые URL в очередь
         for url in start_urls:
             await self.queue.add_url(url, priority=10, depth=0)
-        
+
         self.logger.info(
             f"Старт краулинга: {len(start_urls)} URL, "
             f"max_pages={max_pages}, max_depth={max_depth}"
         )
-        
+
         # Счётчик активных задач для отслеживания завершения
         active_tasks: Set[asyncio.Task] = set()
-        
+
         progress_task = None
         if show_progress:
             progress_task = asyncio.create_task(self._progress_loop(max_pages))
-        
+
         try:
             while True:
-                # Проверяем лимит страниц
-                if len(self.results) >= max_pages:
-                    self.logger.info(f"Достигнут лимит страниц: {max_pages}")
-                    break
-                
+                # Сколько страниц уже "занято": завершённые + в полёте.
+                # Именно это число сравниваем с лимитом, чтобы не запланировать
+                # лишние задачи до того, как завершатся текущие.
+                # Без этого при max_pages=3 и 20 стартовых URL цикл успевал
+                # выгрести всю очередь и создать задачи на все 20 URL.
+                in_flight = len(self.results) + len(active_tasks)
+
+                if in_flight >= max_pages:
+                    # Лимит исчерпан. Новые URL не планируем.
+                    # Если активных задач нет — выходим; иначе даём им
+                    # завершиться и проверяем лимит ещё раз.
+                    if not active_tasks:
+                        self.logger.info(f"Достигнут лимит страниц: {max_pages}")
+                        break
+                    await asyncio.gather(*active_tasks, return_exceptions=True)
+                    if len(self.results) >= max_pages:
+                        self.logger.info(f"Достигнут лимит страниц: {max_pages}")
+                        break
+                    continue
+
                 # Проверяем завершение: очередь пуста и нет активных задач
                 if await self.queue.empty() and not active_tasks:
                     # Проверяем ещё раз — возможно, задачи добавили URL
                     await asyncio.sleep(0.05)
                     if await self.queue.empty() and not active_tasks:
                         break
-                
+
                 # Забираем URL из очереди
                 result = await self.queue.get_next()
-                
+
                 if result is None:
                     # Очередь пуста, но активные задачи могут добавить URL
                     if active_tasks:
@@ -403,16 +451,16 @@ class AsyncCrawler:
                         continue
                     else:
                         break
-                
+
                 url, depth = result
-                
+
                 # Запускаем задачу
                 task = asyncio.create_task(
                     self._crawl_one(url, depth, max_depth, same_domain_only, start_domains)
                 )
                 active_tasks.add(task)
                 task.add_done_callback(active_tasks.discard)
-        
+
         finally:
             if progress_task:
                 progress_task.cancel()
@@ -420,19 +468,19 @@ class AsyncCrawler:
                     await progress_task
                 except asyncio.CancelledError:
                     pass
-            
+
             # Ждём завершения оставшихся задач
             if active_tasks:
                 await asyncio.gather(*active_tasks, return_exceptions=True)
-        
+
         elapsed = time.monotonic() - self._started_at
         self.logger.info(
             f"Краулинг завершён: {len(self.results)} страниц, "
             f"{len(self.error_results)} ошибок, {elapsed:.2f}с"
         )
-        
+
         return self.results
-    
+
     async def _crawl_one(
         self,
         url: str,
@@ -444,40 +492,40 @@ class AsyncCrawler:
         """Обработать одну страницу и добавить найденные ссылки в очередь."""
         try:
             page = await self._process_one(url, depth)
-            
+
             if page is None:
                 await self.queue.mark_processed(url)
                 return
-            
+
             # Сохраняем результат
             self.results[url] = page
-            
+
             # Сохраняем в storage
             if self.storage:
                 try:
                     await self.storage.save(page.to_dict())
                 except Exception as e:
                     self.logger.warning(f"Ошибка сохранения {url}: {e}")
-            
+
             await self.queue.mark_processed(url)
-            
+
             # Добавляем найденные ссылки в очередь
             if depth < max_depth and page.links:
                 for link in page.links:
                     if not self._is_url_allowed(link, url, same_domain_only, start_domains):
                         continue
                     await self.queue.add_url(link, priority=0, depth=depth + 1)
-        
+
         except RobotsBlockedError:
             await self.queue.mark_failed(url, "Заблокирован robots.txt")
-        
+
         except CircuitBreakerOpenError:
             await self.queue.mark_failed(url, "Circuit breaker открыт")
-        
+
         except Exception as e:
             self.logger.debug(f"Ошибка обработки {url}: {e}")
             await self.queue.mark_failed(url, str(e))
-    
+
     def _is_url_allowed(
         self,
         url: str,
@@ -494,24 +542,24 @@ class AsyncCrawler:
                 return False
         except Exception:
             return False
-        
+
         # same_domain_only
         if same_domain_only:
             if parsed.netloc not in start_domains:
                 return False
-        
+
         # exclude_patterns
         for pattern in self._exclude_re:
             if pattern.search(url):
                 return False
-        
+
         # include_patterns (если заданы — URL должен подходить хотя бы под один)
         if self._include_re:
             if not any(p.search(url) for p in self._include_re):
                 return False
-        
+
         return True
-    
+
     async def _progress_loop(self, max_pages: int) -> None:
         """Периодический вывод прогресса."""
         try:
@@ -527,15 +575,15 @@ class AsyncCrawler:
                 )
         except asyncio.CancelledError:
             pass
-    
+
     # ---------- Статистика и отчёты ----------
-    
+
     def get_stats(self) -> dict:
         """Получить статистику краулера."""
         elapsed = 0.0
         if self._started_at:
             elapsed = time.monotonic() - self._started_at
-        
+
         return {
             "pages_fetched": self._stats["pages_fetched"],
             "pages_parsed": self._stats["pages_parsed"],
@@ -550,19 +598,19 @@ class AsyncCrawler:
                 self.circuit_breaker.get_stats() if self.circuit_breaker else {}
             ),
         }
-    
+
     def get_error_report(self) -> str:
         """Текстовый отчёт об ошибках."""
         if not self.error_results:
             return "Ошибок нет"
-        
+
         lines = [f"Ошибок: {len(self.error_results)}", ""]
-        
+
         # Группируем по типу
         by_type: Dict[str, List[str]] = {}
         for url, info in self.error_results.items():
             by_type.setdefault(info.get("error_type", "unknown"), []).append(url)
-        
+
         for err_type, urls in sorted(by_type.items(), key=lambda x: -len(x[1])):
             lines.append(f"{err_type}: {len(urls)}")
             for url in urls[:5]:
@@ -570,9 +618,9 @@ class AsyncCrawler:
             if len(urls) > 5:
                 lines.append(f"  ... и ещё {len(urls) - 5}")
             lines.append("")
-        
+
         return "\n".join(lines)
-    
+
     def __repr__(self) -> str:
         return (
             f"<AsyncCrawler(pages={len(self.results)}, "
