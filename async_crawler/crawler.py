@@ -170,9 +170,11 @@ class AsyncCrawler:
     async def _fetch_url_raw(self, url: str) -> str:
         """Загрузить страницу без ограничения конкурентности (внутренний метод).
 
-        Не берёт семафоры — вызывающий сам решает, как ограничивать конкурентность.
-        Используется в fetch_url()/fetch_urls() через обёртки и в основном
-        pipeline (_process_one), который уже держит семафоры.
+        Не берёт семафоры и не проверяет rate limit — вызывающий сам решает,
+        как ограничивать конкурентность и скорость. Используется в
+        fetch_url()/fetch_urls() через обёртки и в основном pipeline
+        (_process_one), который уже держит семафоры и применяет rate limit
+        перед каждой попыткой.
         """
         session = await self._get_session()
 
@@ -210,10 +212,11 @@ class AsyncCrawler:
             raise CrawlerError(f"Неизвестная ошибка: {e}", url)
 
     async def fetch_url(self, url: str) -> str:
-        """Загрузить одну страницу с учётом max_concurrent и per-domain лимита.
+        """Загрузить одну страницу с учётом max_concurrent, per-domain лимита
+        и rate limiting.
 
-        Использует те же семафоры, что и основной pipeline, поэтому
-        fetch_url()/fetch_urls() не обходят ограничение конкурентности.
+        Использует те же семафоры и rate limiter, что и основной pipeline,
+        поэтому fetch_url()/fetch_urls() не обходят ограничения.
 
         Args:
             url: URL страницы
@@ -226,6 +229,7 @@ class AsyncCrawler:
         """
         domain_sem = await self.semaphores.acquire(url)
         try:
+            await self.rate_limiter.acquire(url)
             return await self._fetch_url_raw(url)
         finally:
             await self.semaphores.release(url, domain_sem)
@@ -320,14 +324,15 @@ class AsyncCrawler:
             except Exception as e:
                 self.logger.warning(f"Ошибка проверки robots: {e}")
 
-        # Rate limiting (учитывает Crawl-delay через RateLimiter)
-        await self.rate_limiter.acquire(url)
-
-        # Семафоры: глобальный + по домену
+        # Семафоры: глобальный + по домену.
+        # Rate limiting НЕ здесь: он должен применяться перед каждой
+        # сетевой попыткой, включая повторы, поэтому перенесён внутрь do_fetch().
         domain_sem = await self.semaphores.acquire(url)
 
         async def do_fetch():
+            # Rate limit применяется перед КАЖДОЙ попыткой (включая retry).
             # Семафоры уже взяты снаружи — не берём их повторно.
+            await self.rate_limiter.acquire(url)
             return await self.fetch_and_parse(url, use_semaphore=False)
 
         try:
@@ -408,31 +413,24 @@ class AsyncCrawler:
         # Счётчик активных задач для отслеживания завершения
         active_tasks: Set[asyncio.Task] = set()
 
+        # Количество ЗАПЛАНИРОВАННЫХ обработок (взятых из очереди).
+        # Именно оно ограничивается max_pages — независимо от того,
+        # завершилась обработка успехом или ошибкой.
+        scheduled_count = 0
+
         progress_task = None
         if show_progress:
             progress_task = asyncio.create_task(self._progress_loop(max_pages))
 
         try:
             while True:
-                # Сколько страниц уже "занято": завершённые + в полёте.
-                # Именно это число сравниваем с лимитом, чтобы не запланировать
-                # лишние задачи до того, как завершатся текущие.
-                # Без этого при max_pages=3 и 20 стартовых URL цикл успевал
-                # выгрести всю очередь и создать задачи на все 20 URL.
-                in_flight = len(self.results) + len(active_tasks)
-
-                if in_flight >= max_pages:
-                    # Лимит исчерпан. Новые URL не планируем.
-                    # Если активных задач нет — выходим; иначе даём им
-                    # завершиться и проверяем лимит ещё раз.
-                    if not active_tasks:
-                        self.logger.info(f"Достигнут лимит страниц: {max_pages}")
-                        break
-                    await asyncio.gather(*active_tasks, return_exceptions=True)
-                    if len(self.results) >= max_pages:
-                        self.logger.info(f"Достигнут лимит страниц: {max_pages}")
-                        break
-                    continue
+                # Если лимит запланированных обработок исчерпан — новые URL
+                # не берём. Дожидаемся активных задач и выходим.
+                if scheduled_count >= max_pages:
+                    if active_tasks:
+                        await asyncio.gather(*active_tasks, return_exceptions=True)
+                    self.logger.info(f"Достигнут лимит страниц: {max_pages}")
+                    break
 
                 # Проверяем завершение: очередь пуста и нет активных задач
                 if await self.queue.empty() and not active_tasks:
@@ -454,9 +452,17 @@ class AsyncCrawler:
 
                 url, depth = result
 
+                # Учитываем запланированную обработку. Декремента нет:
+                # ошибка тоже расходует лимит.
+                scheduled_count += 1
+
                 # Запускаем задачу
                 task = asyncio.create_task(
-                    self._crawl_one(url, depth, max_depth, same_domain_only, start_domains)
+                    self._crawl_one(
+                        url, depth, max_depth, same_domain_only, start_domains,
+                        max_pages=max_pages,
+                        scheduled_count=scheduled_count,
+                    )
                 )
                 active_tasks.add(task)
                 task.add_done_callback(active_tasks.discard)
@@ -488,6 +494,8 @@ class AsyncCrawler:
         max_depth: int,
         same_domain_only: bool,
         start_domains: Set[str],
+        max_pages: Optional[int] = None,
+        scheduled_count: int = 0,
     ) -> None:
         """Обработать одну страницу и добавить найденные ссылки в очередь."""
         try:
@@ -509,8 +517,14 @@ class AsyncCrawler:
 
             await self.queue.mark_processed(url)
 
-            # Добавляем найденные ссылки в очередь
-            if depth < max_depth and page.links:
+            # Добавляем найденные ссылки в очередь.
+            # Не раздуваем очередь, если лимит запланированных обработок
+            # уже исчерпан.
+            if (
+                depth < max_depth
+                and page.links
+                and (max_pages is None or scheduled_count < max_pages)
+            ):
                 for link in page.links:
                     if not self._is_url_allowed(link, url, same_domain_only, start_domains):
                         continue
